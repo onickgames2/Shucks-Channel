@@ -71,10 +71,12 @@
   .warn code{font-family:"JetBrains Mono",monospace; font-size:.85em}
 
   .stage{position:relative; background:var(--stage); border-radius:14px; overflow:hidden; aspect-ratio:16/9}
-  .stage video{width:100%; height:100%; display:block; background:var(--stage)}
+  .stage video{width:100%; height:100%; display:block; background:var(--stage); object-fit:contain}
   .overlay{position:absolute; inset:0; display:grid; place-items:center; text-align:center; padding:24px;
     color:#E7ECFA; background:var(--stage); font-size:1.05rem}
   .overlay[hidden]{display:none}
+  .stage .sound{position:absolute; left:12px; bottom:12px; background:var(--accent); border-color:var(--accent); color:var(--accent-ink)}
+  .stage .full{position:absolute; right:12px; bottom:12px}
   .meta{display:flex; justify-content:space-between; gap:12px; margin-top:10px; color:var(--muted); font-size:.95rem}
   .meta strong{color:var(--ink)}
 
@@ -102,7 +104,7 @@
   </div>
 
   <div id="configWarn" class="warn" hidden>
-    Preencha o bloco <code>CONFIG</code> no início do script deste arquivo (URL e chave anon do Supabase, host do servidor de vídeo). O passo a passo está em <code>configuracao-supabase.md</code>.
+    Preencha o bloco <code>CONFIG</code> no início do script deste arquivo com a URL e a chave anon do Supabase. O passo a passo está em <code>configuracao-livekit.md</code>.
   </div>
 
   <div id="grid" class="grid">
@@ -111,12 +113,14 @@
         <h2>Nova live</h2>
         <label for="title">Nome da live</label>
         <input id="title" type="text" maxlength="80" placeholder="Ex.: Testando meu jogo no Roblox">
+        <label for="code">Código de criador</label>
+        <input id="code" type="password" autocomplete="off" placeholder="O código que você definiu no Supabase">
         <button id="btnCreate" class="primary">Criar live</button>
         <p class="error" id="createError" role="alert"></p>
       </section>
 
       <section class="panel" id="detailPanel" hidden>
-        <h2>Configure no OBS</h2>
+        <h2>Configure o app de transmissão</h2>
         <label for="fServer">Servidor</label>
         <div class="row">
           <input id="fServer" class="mono" type="text" readonly>
@@ -128,7 +132,7 @@
           <button id="btnReveal">Mostrar</button>
           <button data-copy="fKey">Copiar</button>
         </div>
-        <p class="hint">OBS → Configurações → Transmissão → Serviço: Personalizado. Cole o servidor e a chave, depois clique em Iniciar transmissão. Não compartilhe a chave.</p>
+        <p class="hint">No OBS: Configurações → Transmissão → Serviço: Personalizado. No celular, use um app como Larix Broadcaster, Streamlabs ou Prism Live Studio com servidor e chave personalizados. Não compartilhe a chave.</p>
 
         <label for="fLink">Link para os amigos</label>
         <div class="row">
@@ -141,9 +145,11 @@
 
     <div class="right">
       <div>
-        <div class="stage">
-          <video id="video" controls playsinline muted></video>
-          <div id="overlay" class="overlay">Aguardando o sinal do OBS.</div>
+        <div class="stage" id="stage">
+          <video id="video" autoplay playsinline muted></video>
+          <div id="overlay" class="overlay">Aguardando o sinal da transmissão.</div>
+          <button id="btnSound" class="sound" hidden>Ativar som</button>
+          <button id="btnFull" class="full" hidden>Tela cheia</button>
         </div>
         <div class="meta">
           <span id="liveTitle"></span>
@@ -169,16 +175,13 @@
 </main>
 
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
-<script src="https://cdn.jsdelivr.net/npm/hls.js@1"></script>
+<script src="https://cdn.jsdelivr.net/npm/livekit-client@2/dist/livekit-client.umd.min.js"></script>
 <script>
 /* ===================== CONFIG ===================== */
 const CONFIG = {
   SUPABASE_URL: "https://SEU-PROJETO.supabase.co",
   SUPABASE_ANON_KEY: "SUA_ANON_KEY",
-  INGEST_HOST: "live.seudominio.com",          // servidor MediaMTX (RTMPS)
-  RTMPS_PORT: 1936,
-  HLS_BASE: "https://live.seudominio.com/live", // onde o MediaMTX serve o HLS (https, sem barra no fim)
-  WATCH_BASE_URL: ""                            // opcional: URL pública onde este HTML está hospedado
+  WATCH_BASE_URL: ""   // opcional: URL pública onde este HTML está hospedado (ex.: https://minhalive.onrender.com/)
 };
 /* ================================================== */
 
@@ -187,71 +190,98 @@ const watchId = new URLSearchParams(location.search).get("v");
 const configured = !CONFIG.SUPABASE_URL.includes("SEU-PROJETO");
 const isStreamer = !watchId;
 
-let sb, hls = null, playing = false, currentPb = null, status = "offline", pollTimer = null;
+let sb, room = null, currentPb = null, status = "offline", statusSet = false;
 let chatSeen = new Set(), chatLastId = 0, chatPollTimer = null;
 
-/* ---------- Status e player ---------- */
+/* ---------- Status e overlay ---------- */
 function setOverlay(text){
   $("#overlay").textContent = text;
   $("#overlay").hidden = !text;
 }
 
+function waitingText(){
+  return watchId ? "A live ainda não começou. Esta página atualiza sozinha." : "Aguardando o sinal da transmissão.";
+}
+
 function setStatus(s){
+  if (statusSet && s === status) return;
+  statusSet = true;
   status = s;
   $("#badge").className = "badge " + (s === "live" ? "on" : "off");
   $("#badgeText").textContent = s === "live" ? "Ao vivo" : "Aguardando sinal";
-  if (s === "live") startPlayer(); else stopPlayer();
+  const v = $("#video");
+  const videoRunning = !v.paused && v.readyState > 2 && !!v.srcObject;
+  if (s === "live") setOverlay(videoRunning ? "" : "Conectando ao vídeo…");
+  else setOverlay(waitingText());
 }
 
-function startPlayer(){
-  if (playing || !currentPb) return;
-  playing = true;
-  setOverlay("Conectando ao vídeo…");
-  const url = `${CONFIG.HLS_BASE}/${currentPb}/index.m3u8`;
+function refreshStatus(){
+  const live = room && [...room.remoteParticipants.values()].some(p => p.identity.startsWith("streamer-"));
+  setStatus(live ? "live" : "offline");
+}
+
+/* ---------- LiveKit (assistir) ---------- */
+async function fnMessage(error){
+  try { const b = await error.context.json(); return b.error || error.message; }
+  catch { return error.message || String(error); }
+}
+
+async function disconnectRoom(){
+  if (room) { try { await room.disconnect(); } catch {} room = null; }
+  document.querySelectorAll("audio[data-lk]").forEach(e => e.remove());
   const v = $("#video");
-  if (v.canPlayType("application/vnd.apple.mpegurl")) {
-    v.src = url;
-    v.play().catch(()=>{});
-    v.onplaying = () => setOverlay("");
-  } else if (window.Hls && Hls.isSupported()) {
-    hls = new Hls({ lowLatencyMode: true });
-    hls.loadSource(url);
-    hls.attachMedia(v);
-    hls.on(Hls.Events.MANIFEST_PARSED, () => { v.play().catch(()=>{}); setOverlay(""); });
-    hls.on(Hls.Events.ERROR, (_, d) => {
-      if (d.fatal) {
-        stopPlayer();
-        if (status === "live") setTimeout(startPlayer, 3000);
-      }
-    });
-  } else {
-    setOverlay("Este navegador não reproduz HLS.");
+  v.srcObject = null;
+  $("#btnSound").hidden = true;
+  $("#btnFull").hidden = true;
+}
+
+async function connectRoom(pb){
+  await disconnectRoom();
+  const { data, error } = await sb.functions.invoke("livekit-token", { body: { playback_id: pb } });
+  if (error || !data || !data.token) {
+    setOverlay("Não foi possível conectar à sala: " + (error ? await fnMessage(error) : "sem token"));
+    return;
+  }
+
+  const L = LivekitClient, E = L.RoomEvent;
+  room = new L.Room({ adaptiveStream: true, dynacast: true });
+
+  room.on(E.TrackSubscribed, track => {
+    if (track.kind === "video") {
+      track.attach($("#video"));
+      $("#btnFull").hidden = false;
+    } else if (track.kind === "audio" && !isStreamer) {
+      const el = track.attach();
+      el.dataset.lk = "1";
+      el.style.display = "none";
+      document.body.appendChild(el);
+      $("#btnSound").hidden = room.canPlaybackAudio;
+    }
+    refreshStatus();
+  });
+
+  room.on(E.TrackUnsubscribed, track => {
+    track.detach().forEach(el => { if (el.id !== "video") el.remove(); });
+    refreshStatus();
+  });
+
+  room.on(E.ParticipantConnected, refreshStatus);
+  room.on(E.ParticipantDisconnected, refreshStatus);
+  room.on(E.Reconnected, refreshStatus);
+  room.on(E.Disconnected, () => setStatus("offline"));
+  room.on(E.AudioPlaybackStatusChanged, () => {
+    $("#btnSound").hidden = !room || room.canPlaybackAudio || isStreamer;
+  });
+
+  try {
+    await room.connect(data.url, data.token);
+    refreshStatus();
+  } catch (e) {
+    setOverlay("Falha ao conectar na sala: " + (e.message || e));
   }
 }
 
-function stopPlayer(){
-  playing = false;
-  if (hls) { hls.destroy(); hls = null; }
-  const v = $("#video");
-  v.removeAttribute("src"); v.load();
-  setOverlay(status === "live" ? "Conectando ao vídeo…" :
-    (watchId ? "A live ainda não começou. Esta página atualiza sozinha." : "Aguardando o sinal do OBS."));
-}
-
-/* ---------- Supabase em tempo real ---------- */
-function watchStatus(pb){
-  sb.channel("st-" + pb)
-    .on("postgres_changes",
-      { event: "UPDATE", schema: "public", table: "streams", filter: `playback_id=eq.${pb}` },
-      p => setStatus(p.new.status))
-    .subscribe();
-  clearInterval(pollTimer);
-  pollTimer = setInterval(async () => {
-    const { data } = await sb.from("streams").select("status").eq("playback_id", pb).maybeSingle();
-    if (data && data.status !== status) setStatus(data.status);
-  }, 8000);
-}
-
+/* ---------- Presença (quantos assistindo) ---------- */
 function joinPresence(pb, isViewer){
   const ch = sb.channel("viewers-" + pb, { config: { presence: { key: crypto.randomUUID() } } });
   ch.on("presence", { event: "sync" }, () => {
@@ -384,11 +414,12 @@ async function deleteMessage(id){
 /* ---------- Abrir uma live ---------- */
 function openStream(row){
   currentPb = row.playback_id;
+  statusSet = false;
   const t = document.createElement("strong");
   t.textContent = row.title;
   $("#liveTitle").replaceChildren(t);
-  setStatus(row.status);
-  watchStatus(currentPb);
+  setStatus("offline");
+  connectRoom(currentPb);
   joinPresence(currentPb, !!watchId);
   startChat(currentPb);
 }
@@ -398,12 +429,11 @@ async function initViewer(){
   $("#grid").classList.add("viewer");
   $("#streamerCol").hidden = true;
   const { data, error } = await sb.from("streams")
-    .select("playback_id,title,status").eq("playback_id", watchId).maybeSingle();
+    .select("playback_id,title").eq("playback_id", watchId).maybeSingle();
   if (error || !data) { setOverlay("Live não encontrada. Confira o link."); return; }
   $("#pageTitle").textContent = data.title;
   document.title = data.title + " · Live";
   openStream(data);
-  setOverlay(data.status === "live" ? "Conectando ao vídeo…" : "A live ainda não começou. Esta página atualiza sozinha.");
 }
 
 /* ---------- Modo transmissor ---------- */
@@ -412,11 +442,11 @@ function watchLinkFor(pb){
   return `${base}?v=${pb}`;
 }
 
-function showDetails(row, secret){
+function showDetails(row, url, key){
   $("#createPanel").hidden = true;
   $("#detailPanel").hidden = false;
-  $("#fServer").value = `rtmps://${CONFIG.INGEST_HOST}:${CONFIG.RTMPS_PORT}/live`;
-  $("#fKey").value = `${row.playback_id}?user=live&pass=${secret}`;
+  $("#fServer").value = url;
+  $("#fKey").value = key;
   $("#fLink").value = watchLinkFor(row.playback_id);
   openStream(row);
 }
@@ -431,34 +461,41 @@ async function ensureSession(){
 
 async function loadLastStream(){
   const { data: rows } = await sb.from("streams")
-    .select("id,playback_id,title,status").order("created_at", { ascending: false }).limit(1);
+    .select("id,playback_id,title").order("created_at", { ascending: false }).limit(1);
   if (!rows || !rows.length) return;
   const row = rows[0];
-  const { data: sec } = await sb.from("stream_secrets").select("secret").eq("stream_id", row.id).maybeSingle();
-  if (sec) showDetails(row, sec.secret);
+  const { data: sec } = await sb.from("stream_secrets")
+    .select("rtmp_url,stream_key").eq("stream_id", row.id).maybeSingle();
+  if (sec) showDetails(row, sec.rtmp_url, sec.stream_key);
 }
 
 async function createStream(){
   const btn = $("#btnCreate");
-  $("#createError").textContent = "";
+  const err = $("#createError");
+  err.textContent = "";
+  const code = $("#code").value.trim();
+  if (!code) { err.textContent = "Digite o código de criador."; $("#code").focus(); return; }
   btn.disabled = true;
   try {
+    await ensureSession();
     const title = $("#title").value.trim() || "Minha live";
-    const { data, error } = await sb.rpc("create_stream", { p_title: title });
-    if (error) throw error;
-    showDetails({ id: data.id, playback_id: data.playback_id, title, status: "offline" }, data.secret);
+    const { data, error } = await sb.functions.invoke("livekit-ingress", { body: { title, code } });
+    if (error) throw new Error(await fnMessage(error));
+    try { localStorage.setItem("creatorCode", code); } catch {}
+    showDetails({ id: data.id, playback_id: data.playback_id, title: data.title }, data.url, data.stream_key);
   } catch (e) {
-    $("#createError").textContent = "Não foi possível criar a live: " + (e.message || e);
+    err.textContent = "Não foi possível criar a live: " + (e.message || e);
   } finally {
     btn.disabled = false;
   }
 }
 
-function resetToCreate(){
-  clearInterval(pollTimer);
+async function resetToCreate(){
   clearInterval(chatPollTimer);
   sb.removeAllChannels();
+  await disconnectRoom();
   currentPb = null;
+  statusSet = false;
   setStatus("offline");
   $("#viewers").textContent = "0";
   $("#liveTitle").replaceChildren();
@@ -488,17 +525,33 @@ $("#btnReveal").addEventListener("click", () => {
   k.type = show ? "text" : "password";
   $("#btnReveal").textContent = show ? "Ocultar" : "Mostrar";
 });
+$("#btnSound").addEventListener("click", async () => {
+  if (room) await room.startAudio();
+  $("#btnSound").hidden = true;
+});
+$("#btnFull").addEventListener("click", () => {
+  const s = $("#stage");
+  if (document.fullscreenElement) document.exitFullscreen();
+  else if (s.requestFullscreen) s.requestFullscreen();
+  else if ($("#video").webkitEnterFullscreen) $("#video").webkitEnterFullscreen();
+});
+$("#video").addEventListener("playing", () => { if (status === "live") setOverlay(""); });
 $("#btnCreate").addEventListener("click", createStream);
 $("#btnNew").addEventListener("click", resetToCreate);
 $("#title").addEventListener("keydown", e => { if (e.key === "Enter") createStream(); });
+$("#code").addEventListener("keydown", e => { if (e.key === "Enter") createStream(); });
 $("#chatSend").addEventListener("click", sendChat);
 $("#chatText").addEventListener("keydown", e => { if (e.key === "Enter") sendChat(); });
 
 /* ---------- Início ---------- */
 (async function init(){
-  let saved = "";
-  try { saved = localStorage.getItem("chatName") || ""; } catch {}
-  $("#chatName").value = saved || (isStreamer ? "Streamer" : "");
+  let savedName = "", savedCode = "";
+  try {
+    savedName = localStorage.getItem("chatName") || "";
+    savedCode = localStorage.getItem("creatorCode") || "";
+  } catch {}
+  $("#chatName").value = savedName || (isStreamer ? "Streamer" : "");
+  $("#code").value = savedCode;
 
   if (!configured) {
     $("#configWarn").hidden = false;
